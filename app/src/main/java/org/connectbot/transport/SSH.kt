@@ -1176,7 +1176,11 @@ open class SSH : AbsTransport {
     }
 
     protected open fun onDisconnect(reason: DisconnectReason = DisconnectReason.IO_ERROR) {
-        bridge?.dispatchDisconnect(reason)
+        // A transport replaced by a reconnect must not end the bridge's new attempt.
+        val currentBridge = bridge ?: return
+        val activeTransport = currentBridge.transport
+        if (activeTransport != null && activeTransport !== this) return
+        currentBridge.dispatchDisconnect(reason)
     }
 
     @VisibleForTesting

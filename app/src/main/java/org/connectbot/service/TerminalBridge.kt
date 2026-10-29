@@ -390,6 +390,10 @@ class TerminalBridge {
         private set
     private var awaitingClose = false
 
+    // Failed reconnect attempts since the last successful connection; drives retry backoff.
+    private var reconnectAttempts = 0
+    private var reconnectRetryJob: Job? = null
+
     private var forcedSize = false
 
     // Network state tracking for grace period
@@ -741,6 +745,8 @@ class TerminalBridge {
             return
         }
         invalidateConfiguredInput()
+        reconnectRetryJob?.cancel()
+        reconnectRetryJob = null
         connectionJob?.cancel()
         relayJob?.cancel()
         relay = null
@@ -1035,6 +1041,9 @@ class TerminalBridge {
     fun onConnected() {
         disconnected = false
         connecting = false
+        reconnectAttempts = 0
+        reconnectRetryJob?.cancel()
+        reconnectRetryJob = null
         transportFailure = null
         disconnectReason = DisconnectReason.UNKNOWN
         sessionAttention.onReconnected()
@@ -1112,11 +1121,17 @@ class TerminalBridge {
     fun dispatchDisconnect(reason: DisconnectReason) {
         invalidateConfiguredInput()
         cancelAutomation()
-        // We don't need to do this multiple times.
+        // We don't need to do this multiple times. A reconnect attempt, however,
+        // starts while `disconnected` is still true (it is only cleared by
+        // onConnected), so its failure must not be swallowed here; otherwise
+        // the bridge stays "connecting" forever, the reconnect overlay never
+        // appears, and the service keeps the dead session alive.
+        val failedReconnectAttempt: Boolean
         synchronized(this) {
-            if (disconnected && reason != DisconnectReason.USER_REQUESTED) {
+            if (disconnected && !connecting && reason != DisconnectReason.USER_REQUESTED) {
                 return
             }
+            failedReconnectAttempt = disconnected && connecting
 
             disconnected = true
             connecting = false
@@ -1148,18 +1163,45 @@ class TerminalBridge {
             )
         ) {
             is DisconnectAction.CloseImmediately -> {
+                reconnectRetryJob?.cancel()
+                reconnectRetryJob = null
                 sessionAttention.onOutputDiscarded()
                 awaitingClose = true
                 triggerDisconnectListener()
             }
 
             is DisconnectAction.AutoReconnect -> {
-                manager.requestReconnect(this)
+                if (failedReconnectAttempt) {
+                    scheduleReconnectRetry()
+                } else {
+                    manager.requestReconnect(this)
+                }
                 manager.notifyBridgeStateChanged()
             }
 
             is DisconnectAction.ShowReconnectOverlay -> {
                 manager.notifyBridgeStateChanged()
+            }
+        }
+    }
+
+    /**
+     * Retry a failed automatic reconnect with exponential backoff
+     * (2s, 4s, 8s, 16s, then every 30s) so a transient failure such as
+     * ENETUNREACH during a network handover does not leave the session dead,
+     * and a persistent failure does not spin in a tight loop. While waiting,
+     * the bridge is disconnected and not connecting, so the reconnect overlay
+     * (with its Close button) is shown.
+     */
+    private fun scheduleReconnectRetry() {
+        reconnectAttempts += 1
+        val delayMs = (1000L shl reconnectAttempts.coerceAtMost(5)).coerceAtMost(MAX_RECONNECT_DELAY_MS)
+        Timber.i("Reconnect attempt $reconnectAttempts for ${host.nickname} failed; retrying in ${delayMs}ms")
+        reconnectRetryJob?.cancel()
+        reconnectRetryJob = scope.launch {
+            delay(delayMs)
+            if (disconnected && !connecting) {
+                manager.requestReconnect(this@TerminalBridge)
             }
         }
     }
@@ -1323,6 +1365,8 @@ class TerminalBridge {
         // Cancel grace period if active
         networkGracePeriodJob?.cancel()
         inGracePeriod = false
+        reconnectRetryJob?.cancel()
+        reconnectRetryJob = null
 
         profileObservationJob?.cancel()
         configuredInputs.close()
@@ -1565,6 +1609,7 @@ class TerminalBridge {
 
         private const val DEFAULT_FONT_SIZE_SP = 10
         private const val FONT_SIZE_STEP = 2
+        private const val MAX_RECONNECT_DELAY_MS = 30_000L
     }
 }
 
